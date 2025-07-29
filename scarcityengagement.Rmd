@@ -1,0 +1,1457 @@
+---
+title: "The Effects of Scarcity on Engagement: Analyzing Review Volume in Beauty E-Commerce"
+author: "Claudia Natasha"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Libraries
+
+```{r setup, include=FALSE}
+library(readr)
+library(tidyverse)
+library(skimr)
+library(janitor)
+library(corrplot)
+library(GGally)
+library(Hmisc)
+library(patchwork)
+library(car)
+library(caret)
+library(e1071)
+library(randomForest)
+library(xgboost)
+library(Metrics)
+library(iml)
+library(reticulate)
+library(dplyr)
+library(knitr)
+library(tidyr)
+library(gt)
+library(ggplot2)
+library(showtext)
+library(Matrix)
+library(glmnet)
+library(digest)
+library(gmp)
+library(ggrepel)
+library(webshot2)
+library(broom)
+library(tibble)
+library(kableExtra)
+```
+
+# Data
+
+```{r data}
+df <- read_csv("product_info.csv")
+```
+
+# Data Cleaning & Preprocessing
+
+## Clean & inspect data
+
+```{r inspect}
+df <- df %>% clean_names()
+glimpse(df)
+skim(df)
+colSums(is.na(df))
+str(df)
+```
+
+## Convert binary variables into factors
+
+```{r factor}
+df <- df %>%
+  mutate(
+    limited_edition = as.factor(limited_edition),
+    sephora_exclusive = as.factor(sephora_exclusive),
+    online_only = as.factor(online_only),
+    new = as.factor(new),
+    out_of_stock = as.factor(out_of_stock)
+  )
+```
+
+## Handle missing data
+
+```{r missing data}
+df <- df %>%
+  mutate(missing_data = ifelse(is.na(reviews) , 1, 0))
+
+table_limited <- df %>%
+  group_by(limited_edition) %>%
+  summarise(missing_count = sum(missing_data),
+            total = n(),
+            missing_percent = round(100 * missing_count / total,2))
+
+print(table_limited)
+
+table_exclusive <- df %>%
+  group_by(sephora_exclusive) %>%
+  summarise(missing_count = sum(missing_data),
+            total = n(),
+            missing_percent = round(100 * missing_count / total,2))
+
+print(table_exclusive)
+
+table_online <- df %>%
+  group_by(online_only) %>%
+  summarise(missing_count = sum(missing_data),
+            total = n(),
+            missing_percent = round(100 * missing_count / total,2))
+
+print(table_online)
+
+df_clean <- df%>%
+  filter(!is.na(reviews))
+```
+
+## Log-transform reviews
+
+```{r log reviews}
+df_clean <- df_clean %>%
+  mutate(log_reviews = log1p(reviews))
+```
+
+## Test for multicollinearity (between rating, review, and loves count)
+
+```{r multicollinearity test}
+vif_model <- lm(reviews ~ rating + loves_count, data = df_clean)
+vif(vif_model)
+
+cor_data <- df_clean[, c("rating", "reviews", "loves_count")]
+
+cor_matrix <- cor(cor_data, use = "complete.obs")
+
+print(cor_matrix)
+
+corrplot(cor_matrix, method = "number", type = "upper", tl.cex = 0.8)
+```
+
+## Visualize reviews distribution
+
+```{r reviews distribution}
+ggplot(df_clean, aes(x = reviews)) +
+  geom_histogram(bins = 30, fill = "skyblue") +
+  labs(title = "Distribution of Reviews")
+
+ggplot(df_clean, aes(x = log_reviews)) +
+  geom_histogram(bins = 30, fill = "skyblue") +
+  labs(title = "Distribution of Log Reviews")
+```
+# Descriptive Statistics
+
+```{r descriptive stats}
+summary(df)
+summary(df_clean)
+
+get_mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Overall summary for reviews
+df %>%
+  summarise(
+    mean_reviews = mean(reviews, na.rm = TRUE),
+    median_reviews = median(reviews, na.rm = TRUE),
+    sd_reviews = sd(reviews, na.rm = TRUE),
+    mode_reviews = get_mode(reviews)
+  )
+
+# Summary by limited edition
+df %>%
+  group_by(limited_edition) %>%
+  summarise(
+    mean_reviews = mean(reviews, na.rm = TRUE),
+    median_reviews = median(reviews, na.rm = TRUE),
+    sd_reviews = sd(reviews, na.rm = TRUE),
+    mode_reviews = get_mode(reviews)
+  )
+
+# Summary by Sephora exclusive
+df %>%
+  group_by(sephora_exclusive) %>%
+  summarise(
+    mean_rating = mean(rating, na.rm = TRUE),
+    median_rating = median(rating, na.rm = TRUE),
+    sd_rating = sd(rating, na.rm = TRUE),
+    mode_rating = get_mode(rating)
+  )
+
+# Summary by online only
+df %>%
+  group_by(online_only) %>%
+  summarise(
+    mean_reviews = mean(reviews, na.rm = TRUE),
+    median_reviews = median(reviews, na.rm = TRUE),
+    sd_reviews = sd(reviews, na.rm = TRUE),
+    mode_reviews = get_mode(reviews)
+  )
+
+# Summary of Price
+summary(df_clean$price_usd)
+sd(df_clean$price_usd, na.rm = TRUE)
+
+# Summary of Child Count
+summary(df_clean$child_count)
+sd(df_clean$child_count, na.rm = TRUE)
+
+# Summary of Out of Stock
+table(df_clean$out_of_stock)
+round(prop.table(table(df_clean$out_of_stock)) * 100, 1)
+
+# Summary of New
+table(df_clean$new)
+round(prop.table(table(df_clean$new)) * 100, 1)
+
+# Summary of Primary Category
+table(df_clean$primary_category)
+
+# Summary for loves_count
+summary(df_clean$loves_count)
+sd(df_clean$loves_count, na.rm = TRUE)
+
+# Summary for reviews
+summary(df_clean$reviews)
+sd(df_clean$reviews, na.rm = TRUE)
+```
+
+# Statistical Tests
+
+```{r stats prep}
+df_clean_anova <- df_clean %>%
+  mutate(
+    product_status_type = case_when(
+      limited_edition == 1 ~ "Limited Edition",
+      sephora_exclusive == 1 ~ "Sephora Exclusive",
+      online_only == 1 ~ "Online Only",
+      TRUE ~ "Regular" # Default for products that are none of the above
+    ) %>%
+      factor(levels = c("Regular", "Limited Edition", "Sephora Exclusive", "Online Only")) # Define order for plotting/interpretation
+  )
+
+# Check the distribution of your new variable
+table(df_clean_anova$product_status_type)
+```
+
+## T-test & Linear Regression (combined scarcity vs. regular)
+
+```{r t-test and linear regression}
+df_clean_anova$scarcity_exclusivity <- ifelse(df_clean_anova$limited_edition == 1 | df_clean_anova$sephora_exclusive == 1 | df_clean$online_only == 1, 1, 0)
+
+t.test(log_reviews ~ scarcity_exclusivity, data = df_clean_anova)
+
+summary(lm(log_reviews ~ scarcity_exclusivity, data = df_clean_anova))
+```
+
+## ANOVA and TukeyHSD
+
+```{r anova}
+anova_result <- aov(log_reviews ~ product_status_type, data = df_clean_anova)
+summary(anova_result)
+
+# TukeyHSD
+tukey_posthoc <- TukeyHSD(anova_result)
+print(tukey_posthoc)
+
+df_clean_anova %>%
+  group_by(product_status_type) %>%
+  summarise(mean_log_reviews = mean(log_reviews),
+            sd_log_reviews = sd(log_reviews),
+            n = n())
+
+# Visuzalize
+df_clean_anova <- df_clean %>%
+  mutate(
+    product_status_type = case_when(
+      limited_edition == 1 ~ "Limited Edition",
+      sephora_exclusive == 1 ~ "Sephora Exclusive",
+      online_only == 1 ~ "Online Only",
+      TRUE ~ "Regular"
+    ) %>%
+      factor(levels = c("Regular", "Sephora Exclusive", "Online Only", "Limited Edition"))
+  )
+
+pairwise_comparisons <- list(
+  c("Regular", "Limited Edition"),
+  c("Regular", "Sephora Exclusive"),
+  c("Regular", "Online Only"),
+  c("Limited Edition", "Sephora Exclusive"),
+  c("Limited Edition", "Online Only"),
+  c("Sephora Exclusive", "Online Only")
+)
+
+fig_anova <- ggplot(df_clean_anova, aes(x = product_status_type, y = log_reviews, fill = product_status_type)) +
+  geom_boxplot(alpha = 0.8, width = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.1, color = "gray40", size = 0.7) +
+  labs(
+    title = "Distribution of Log Reviews by Product Group",
+    x = "Group",
+    y = "Log(Review Count)"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+print(fig_anova)
+```
+
+# Predictive Models
+
+## Preprocessing for modeling
+
+### Subset data
+
+```{r subset}                                                                                         
+product_lookup <- df_clean %>%
+  select(product_id, product_name)
+
+# Drop from modeling data
+df_model <- df_clean %>%
+  select(-product_id, -product_name, -brand_id, -loves_count, -rating, -reviews, -size, -variation_value, -variation_desc, -ingredients, -value_price_usd, -sale_price_usd, -secondary_category, -tertiary_category, -child_max_price, -child_min_price, -highlights, -variation_type, -missing_data)
+
+# Check for NAs
+colSums(is.na(df_model))
+```
+
+### One-hot encoding
+
+```{r one-hot encoding}
+# Ensure categorical variables are factors
+df_model$brand_name <- as.factor(df_model$brand_name)
+df_model$primary_category <- as.factor(df_model$primary_category)
+
+# One-hot encode predictors (removes intercept column)
+X_encoded <- model.matrix(log_reviews ~ ., data = df_model)[, -1]
+
+# Separate target variable
+y <- df_model$log_reviews
+```
+
+### Scale predictors (z-score normalization)
+
+```{r scale}
+X_scaled <- scale(X_encoded)
+```
+
+### Combine into final dataset
+
+```{r final dataset}
+df_ready <- data.frame(X_scaled, log_reviews = y)
+```
+
+### Prepare Optuna
+```{r optuna prep}
+reticulate::virtualenv_create("r-optuna-env")
+
+reticulate::py_install(
+  packages = c("optuna", "xgboost", "numpy", "scikit-learn"),
+  envname = "r-optuna-env",
+  method = "auto",
+  pip = TRUE
+)
+
+optuna <- import("optuna")
+```
+
+### XGBoost-based feature selection
+```{r feature selection}
+# Set global seed
+global_seed <- 310347
+
+# Prepare full feature matrix and target
+X_all <- as.matrix(df_ready %>% select(-log_reviews))
+y_all <- df_ready$log_reviews
+
+# Set sampler with fixed seed for reproducibility
+global_seed <- as.integer(310347)
+sampler <- optuna$samplers$TPESampler(seed = global_seed)
+study_fs <- optuna$create_study(direction = "minimize", sampler = sampler)
+
+# Define Optuna objective function
+objective_fs <- function(trial) {
+  set.seed(global_seed)  # Ensures reproducibility per trial
+  
+  top_n <- trial$suggest_int("top_n", 10, ncol(X_all))
+
+  # Train shallow XGBoost to get importance
+  dtrain_all <- xgb.DMatrix(data = X_all, label = y_all)
+  xgb_temp <- xgboost(
+    data = dtrain_all,
+    objective = "reg:squarederror",
+    nrounds = 50,
+    max_depth = 3,
+    eta = 0.1,
+    seed = global_seed,
+    subsample = 1.0,
+    colsample_bytree = 1.0,
+    verbose = 0
+  )
+
+  # Extract top_n most important features
+  importance_matrix <- xgb.importance(model = xgb_temp)
+  selected_features <- importance_matrix$Feature[1:min(top_n, nrow(importance_matrix))]
+
+  # Prepare dataset with selected features
+  df_selected <- df_ready %>%
+    select(all_of(selected_features), log_reviews)
+
+  # Split into train/valid
+  set.seed(global_seed)
+  n <- nrow(df_selected)
+  idx <- sample(1:n)
+  train_idx <- idx[1:floor(0.6 * n)]
+  valid_idx <- idx[(floor(0.6 * n) + 1):floor(0.8 * n)]
+
+  train_data <- df_selected[train_idx, ]
+  valid_data <- df_selected[valid_idx, ]
+
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data[, -ncol(train_data)]), label = train_data$log_reviews)
+  dvalid <- xgb.DMatrix(data = as.matrix(valid_data[, -ncol(valid_data)]), label = valid_data$log_reviews)
+
+  # Train evaluation model
+  model <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eta = 0.1,
+      max_depth = 6,
+      seed = global_seed
+    ),
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+
+  # Evaluate RMSE
+  preds <- predict(model, newdata = dvalid)
+  rmse <- sqrt(mean((preds - valid_data$log_reviews)^2))
+
+  return(rmse)
+}
+
+# Run Optuna search (stable and reproducible)
+study_fs$optimize(objective_fs, n_trials = 30L)
+
+# Output best number of features
+best_top_n <- study_fs$best_params$top_n
+cat("Best number of features:", best_top_n, "\n")
+```
+
+### Top features
+
+```{r top features}
+X_all <- as.matrix(df_ready %>% select(-log_reviews))
+y_all <- df_ready$log_reviews
+
+colnames(X_all) <- colnames(df_ready)[colnames(df_ready) != "log_reviews"]
+
+dtrain_all <- xgb.DMatrix(data = X_all, label = y_all)
+
+final_xgb <- xgboost(
+  data = dtrain_all,
+  objective = "reg:squarederror",
+  nrounds = 100,
+  max_depth = 5,
+  eta = 0.1,
+  verbose = 0
+)
+
+importance_matrix_final <- xgb.importance(model = final_xgb)
+
+top_features_final <- head(na.omit(importance_matrix_final$Feature), best_top_n)
+
+length(top_features_final)
+
+
+df_selected <- df_ready %>%
+  select(all_of(top_features_final), log_reviews)
+
+print(top_features_final)
+```
+
+### Split data (train/validation/test)
+
+```{r split}
+set.seed(310347)
+n <- nrow(df_selected)
+
+# Randomly shuffle row indices
+idx <- sample(1:n)
+
+# Split indices
+train_idx <- idx[1:round(0.6 * n)]
+valid_idx <- idx[(round(0.6 * n) + 1):round(0.8 * n)]
+test_idx <- idx[(round(0.8 * n) + 1):n]
+
+# Subset datasets
+train_data <- df_selected[train_idx, ]
+valid_data <- df_selected[valid_idx, ]
+test_data <- df_selected[test_idx, ]
+```
+
+## Initial model evaluation
+
+### Define evaluation function
+```{r eval function}
+evaluate_model <- function(true, pred, model_name = "Model") {
+  correlation <- cor(pred, true)
+  rmse_val <- rmse(true, pred)
+  mae_val <- mae(true, pred)
+  ss_res <- sum((true - pred)^2)
+  ss_tot <- sum((true - mean(true))^2)
+  r2_val <- 1 - ss_res / ss_tot
+  minmax_acc <- mean(pmin(true, pred) / pmax(true, pred))
+  
+  data.frame(
+    Model = model_name,
+    COR = round(correlation, 4),
+    RMSE = round(rmse_val, 4),
+    MAE = round(mae_val, 4),
+    R2 = round(r2_val, 4),
+    MinMaxAcc = round(minmax_acc, 4)
+  )
+}
+```
+
+### Fit and evaluate all four models
+
+```{r initial eval}
+results_list <- list()
+
+# Prepare train and validation sets
+X_train <- as.matrix(train_data[, names(train_data) != "log_reviews"])
+y_train <- train_data$log_reviews
+X_valid <- as.matrix(valid_data[, names(valid_data) != "log_reviews"])
+y_valid <- valid_data$log_reviews
+
+## 1. Linear Regression
+lm_model <- lm(log_reviews ~ ., data = train_data)
+lm_pred <- predict(lm_model, newdata = valid_data)
+results_list[[1]] <- evaluate_model(y_valid, lm_pred, "Linear Regression")
+
+## 2. SVM
+svm_model <- svm(log_reviews ~ ., data = train_data)
+svm_pred <- predict(svm_model, newdata = valid_data)
+results_list[[2]] <- evaluate_model(y_valid, svm_pred, "SVM")
+
+## 3. Random Forest
+rf_model <- randomForest(log_reviews ~ ., data = train_data)
+rf_pred <- predict(rf_model, newdata = valid_data)
+results_list[[3]] <- evaluate_model(y_valid, rf_pred, "Random Forest")
+
+## 4. XGBoost
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dvalid <- xgb.DMatrix(data = X_valid, label = y_valid)
+
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  nrounds = 100,
+  verbose = 0
+)
+xgb_pred <- predict(xgb_model, newdata = dvalid)
+results_list[[4]] <- evaluate_model(y_valid, xgb_pred, "XGBoost")
+
+# Combine results
+model_results <- do.call(rbind, results_list)
+print(model_results)
+```
+
+## Hyperparameters tuning
+
+### XGBoost
+
+```{r hyperparameters xgboost}
+# Combine training and validation sets
+train_valid_data <- rbind(train_data, valid_data)
+
+X_train <- as.matrix(train_valid_data[, -ncol(train_valid_data)])  # predictors
+y_train <- train_valid_data$log_reviews
+
+X_test <- as.matrix(test_data[, -ncol(test_data)])
+y_test <- test_data$log_reviews
+
+dtest <- xgb.DMatrix(data = X_test, label = y_test)
+
+# Define Optuna objective with 5-fold CV
+objective_xgb_cv <- function(trial) {
+  param <- list(
+    booster = "gbtree",
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = trial$suggest_float("eta", 0.01, 0.3),
+    max_depth = trial$suggest_int("max_depth", 3L, 10L),
+    subsample = trial$suggest_float("subsample", 0.5, 1.0),
+    colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0),
+    min_child_weight = trial$suggest_int("min_child_weight", 1L, 10L),
+    gamma = trial$suggest_float("gamma", 0, 5),
+    lambda = trial$suggest_float("lambda", 1, 10),
+    alpha = trial$suggest_float("alpha", 0, 5)
+  )
+
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+
+  cv_result <- xgb.cv(
+    params = param,
+    data = dtrain,
+    nfold = 5,
+    nrounds = trial$suggest_int("nrounds", 50L, 300L),
+    early_stopping_rounds = 10,
+    verbose = 0,
+    showsd = FALSE
+  )
+
+  return(min(cv_result$evaluation_log$test_rmse_mean))
+}
+
+# Run the Optuna study
+study <- optuna$create_study(direction = "minimize")
+study$optimize(objective_xgb_cv, n_trials = 50L)
+
+# Extract best parameters
+best_params <- study$best_params
+best_nrounds <- best_params$nrounds
+best_params$nrounds <- NULL  # remove nrounds from param list
+best_params
+best_nrounds
+
+# Convert training data
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+
+# Train final model
+final_model <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+preds <- predict(final_model, newdata = dtest)
+
+# Evaluate
+correlation <- cor(preds, y_test)
+rmse <- sqrt(mean((preds - y_test)^2))
+mae <- mean(abs(preds - y_test))
+ss_res <- sum((y_test - preds)^2)
+ss_tot <- sum((y_test - mean(y_test))^2)
+r2 <- 1 - ss_res / ss_tot
+minmax_acc <- mean(pmin(preds, y_test) / pmax(preds, y_test))
+
+# Output results
+xgb_result <- data.frame(
+  Model = "XGBoost Tuned (Test)",
+  COR = round(correlation, 4),
+  RMSE = round(rmse, 4),
+  MAE = round(mae, 4),
+  R2 = round(r2, 4),
+  MinMaxAcc = round(minmax_acc, 4)
+)
+```
+
+
+### Elastic Net
+```{r hyperparameters elasticnet}
+objective_lm_cv <- function(trial) {
+  alpha <- trial$suggest_float("alpha", 0, 1)
+  lambda <- trial$suggest_loguniform("lambda", 1e-4, 1)
+
+  # 5-fold CV manually
+  folds <- caret::createFolds(train_valid_data$log_reviews, k = 5, list = TRUE, returnTrain = FALSE)
+  rmse_list <- c()
+
+  for (fold in folds) {
+    train_fold <- train_valid_data[-fold, ]
+    valid_fold <- train_valid_data[fold, ]
+
+    model <- glmnet(
+      x = as.matrix(train_fold[, -ncol(train_fold)]),
+      y = train_fold$log_reviews,
+      alpha = alpha,
+      lambda = lambda,
+      standardize = TRUE
+    )
+
+    preds <- predict(model, newx = as.matrix(valid_fold[, -ncol(valid_fold)]), s = lambda)
+    rmse <- sqrt(mean((preds - valid_fold$log_reviews)^2))
+    rmse_list <- c(rmse_list, rmse)
+  }
+
+  return(mean(rmse_list))
+}
+
+study_lm <- optuna$create_study(direction = "minimize")
+study_lm$optimize(objective_lm_cv, n_trials = 50L)
+
+# Final model
+alpha <- study_lm$best_params$alpha
+lambda <- study_lm$best_params$lambda
+alpha
+lambda
+final_lm <- glmnet(
+  x = as.matrix(train_valid_data[, -ncol(train_valid_data)]),
+  y = train_valid_data$log_reviews,
+  alpha = alpha,
+  lambda = lambda
+)
+pred_lm <- predict(final_lm, newx = as.matrix(test_data[, -ncol(test_data)]), s = lambda)
+
+# Evaluate
+lm_result <- data.frame(
+  Model = "Elastic Net Tuned (Test)",
+  COR = round(cor(pred_lm, test_data$log_reviews), 4),
+  RMSE = round(sqrt(mean((pred_lm - test_data$log_reviews)^2)), 4),
+  MAE = round(mean(abs(pred_lm - test_data$log_reviews)), 4),
+  R2 = round(1 - sum((pred_lm - test_data$log_reviews)^2) / sum((test_data$log_reviews - mean(test_data$log_reviews))^2), 4),
+  MinMaxAcc = round(mean(pmin(pred_lm, test_data$log_reviews) / pmax(pred_lm, test_data$log_reviews)), 4)
+)
+```
+
+### SVM
+```{r hyperparameters svm}
+objective_svm_cv <- function(trial) {
+  cost <- trial$suggest_loguniform("cost", 0.1, 10)
+  gamma <- trial$suggest_loguniform("gamma", 1e-3, 1)
+
+  # 5-fold CV manually
+  k <- 5
+  folds <- sample(rep(1:k, length.out = nrow(train_valid_data)))
+  errors <- c()
+
+  for (i in 1:k) {
+    fold_train <- train_valid_data[folds != i, ]
+    fold_valid <- train_valid_data[folds == i, ]
+
+    model <- svm(log_reviews ~ ., data = fold_train, cost = cost, gamma = gamma, kernel = "radial")
+    preds <- predict(model, newdata = fold_valid)
+    errors <- c(errors, sqrt(mean((preds - fold_valid$log_reviews)^2)))
+  }
+
+  return(mean(errors))
+}
+
+study_svm <- optuna$create_study(direction = "minimize")
+study_svm$optimize(objective_svm_cv, n_trials = 30L)
+
+# Final model
+cost <- study_svm$best_params$cost
+gamma <- study_svm$best_params$gamma
+final_svm <- svm(log_reviews ~ ., data = train_valid_data, cost = cost, gamma = gamma, kernel = "radial")
+pred_svm <- predict(final_svm, newdata = test_data)
+cost
+gamma
+
+# Evaluate
+svm_result <- data.frame(
+  Model = "SVM Tuned (Test)",
+  COR = round(cor(pred_svm, test_data$log_reviews), 4),
+  RMSE = round(sqrt(mean((pred_svm - test_data$log_reviews)^2)), 4),
+  MAE = round(mean(abs(pred_svm - test_data$log_reviews)), 4),
+  R2 = round(1 - sum((pred_svm - test_data$log_reviews)^2) / sum((test_data$log_reviews - mean(test_data$log_reviews))^2), 4),
+  MinMaxAcc = round(mean(pmin(pred_svm, test_data$log_reviews) / pmax(pred_svm, test_data$log_reviews)), 4)
+)
+```
+
+### Random Forest
+```{r hyperparameters rf}
+objective_rf_cv <- function(trial) {
+  mtry <- trial$suggest_int("mtry", 1, ncol(train_valid_data) - 1)
+  ntree <- trial$suggest_int("ntree", 50, 300)
+
+  k <- 5
+  folds <- sample(rep(1:k, length.out = nrow(train_valid_data)))
+  errors <- c()
+
+  for (i in 1:k) {
+    fold_train <- train_valid_data[folds != i, ]
+    fold_valid <- train_valid_data[folds == i, ]
+
+    model <- randomForest(log_reviews ~ ., data = fold_train, mtry = mtry, ntree = ntree)
+    preds <- predict(model, newdata = fold_valid)
+    errors <- c(errors, sqrt(mean((preds - fold_valid$log_reviews)^2)))
+  }
+
+  return(mean(errors))
+}
+
+study_rf <- optuna$create_study(direction = "minimize")
+study_rf$optimize(objective_rf_cv, n_trials = 30L)
+
+# Final model
+mtry <- study_rf$best_params$mtry
+ntree <- study_rf$best_params$ntree
+final_rf <- randomForest(log_reviews ~ ., data = train_valid_data, mtry = mtry, ntree = ntree)
+pred_rf <- predict(final_rf, newdata = test_data)
+mtry
+ntree
+
+# Evaluate
+rf_result <- data.frame(
+  Model = "Random Forest Tuned (Test)",
+  COR = round(cor(pred_rf, test_data$log_reviews), 4),
+  RMSE = round(sqrt(mean((pred_rf - test_data$log_reviews)^2)), 4),
+  MAE = round(mean(abs(pred_rf - test_data$log_reviews)), 4),
+  R2 = round(1 - sum((pred_rf - test_data$log_reviews)^2) / sum((test_data$log_reviews - mean(test_data$log_reviews))^2), 4),
+  MinMaxAcc = round(mean(pmin(pred_rf, test_data$log_reviews) / pmax(pred_rf, test_data$log_reviews)), 4)
+)
+```
+
+## Combine results for evaluation
+
+```{r hyperparameters eval}
+results_final_test <- rbind(lm_result, svm_result, rf_result, xgb_result)
+print(results_final_test)
+```
+
+# Final iterations - 5 fold cv + 10 random seeds
+
+## Manually define best parameters
+
+```{r best params}
+# XGBoost best params
+xgb_best_params <- list(
+  eta = 0.07503234,
+  max_depth = 9,
+  subsample = 0.5595529,
+  colsample_bytree = 0.7289816,
+  min_child_weight = 2,
+  gamma = 0.03696568,
+  lambda = 1.037925,
+  alpha = 1.048939
+)
+xgb_best_nrounds <- 169
+
+# SVM best params
+svm_best_params <- list(
+  cost = 6.27021,
+  gamma = 0.004523645
+)
+
+# Random Forest best params
+rf_best_params <- list(
+  mtry = 30,
+  ntree = 75
+)
+
+# Elastic Net best params
+enet_best_params <- list(
+  alpha = 0.5553393,
+  lambda = 0.003335692
+)
+```
+
+## Generate 10 random seeds
+
+```{r random seeds}
+# Plug in string prompt
+input_string <- "claudia2025"
+
+# Run the MD5-based seed generator
+md5_hash <- function(input_string) {
+  digest(input_string, algo = "md5", serialize = FALSE)
+}
+
+get_seed_list <- function(input_string, n_seeds = 10) {
+  hash <- md5_hash(input_string)
+  number <- as.bigz(paste0("0x", hash))
+  base_seed <- as.integer(number %% .Machine$integer.max)
+  set.seed(base_seed)
+  seeds <- sample.int(2^31 - 1, size = n_seeds, replace = FALSE) - 1
+  return(seeds)
+}
+
+# Generate 10 seeds
+seeds <- get_seed_list("claudia2025", n_seeds = 10)
+print(seeds)
+```
+
+## Loop through each of the 10 seeds and evaluate models + split into train/valid/test
+
+```{r final models}
+data <- df_selected
+
+seeds <- c(
+  1858457295, 2036963932, 192671141, 468479813, 53785150,
+  1856229789, 1637320965, 659875641, 1107319086, 359741198
+)
+
+test_results <- list()
+
+for (seed in seeds) {
+  set.seed(seed)
+
+  # Split data: 60% train, 20% valid, 20% test
+  n <- nrow(data)
+  idx <- sample(seq_len(n))
+  train_idx <- idx[1:floor(0.6 * n)]
+  valid_idx <- idx[(floor(0.6 * n) + 1):(floor(0.8 * n))]
+  test_idx <- idx[(floor(0.8 * n) + 1):n]
+
+  train_data <- data[train_idx, ]
+  valid_data <- data[valid_idx, ]
+  test_data <- data[test_idx, ]
+
+  #### Elastic Net ####
+  model_lm <- glmnet(
+    x = as.matrix(train_data[, -ncol(train_data)]),
+    y = train_data$log_reviews,
+    alpha = enet_best_params$alpha,
+    lambda = enet_best_params$lambda
+  )
+  pred_lm <- predict(model_lm, newx = as.matrix(test_data[, -ncol(test_data)]), s = enet_best_params$lambda)
+
+  #### SVM ####
+  model_svm <- svm(
+    log_reviews ~ ., data = train_data,
+    cost = svm_best_params$cost,
+    gamma = svm_best_params$gamma,
+    kernel = "radial",
+    scale = TRUE
+  )
+  pred_svm <- predict(model_svm, newdata = test_data)
+
+  #### Random Forest ####
+  model_rf <- randomForest(
+    log_reviews ~ ., data = train_data,
+    mtry = rf_best_params$mtry,
+    ntree = rf_best_params$ntree
+  )
+  pred_rf <- predict(model_rf, newdata = test_data)
+
+  #### XGBoost ####
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data[, -ncol(train_data)]), label = train_data$log_reviews)
+  dtest <- xgb.DMatrix(data = as.matrix(test_data[, -ncol(test_data)]), label = test_data$log_reviews)
+
+  model_xgb <- xgb.train(
+    params = c(xgb_best_params, objective = "reg:squarederror"),
+    data = dtrain,
+    nrounds = xgb_best_nrounds,
+    verbose = 0
+  )
+  pred_xgb <- predict(model_xgb, newdata = dtest)
+
+  #### Evaluation helper ####
+  eval_metrics <- function(preds, actual) {
+    cor_val <- cor(preds, actual)
+    rmse <- sqrt(mean((preds - actual)^2))
+    mae <- mean(abs(preds - actual))
+    r2 <- 1 - sum((preds - actual)^2) / sum((actual - mean(actual))^2)
+    minmax <- mean(pmin(preds, actual) / pmax(preds, actual))
+    return(c(COR = cor_val, RMSE = rmse, MAE = mae, R2 = r2, MinMaxAcc = minmax))
+  }
+
+  metrics_mat <- rbind(
+    eval_metrics(pred_lm, test_data$log_reviews),
+    eval_metrics(pred_svm, test_data$log_reviews),
+    eval_metrics(pred_rf, test_data$log_reviews),
+    eval_metrics(pred_xgb, test_data$log_reviews)
+  )
+  
+  colnames(metrics_mat) <- c("COR", "RMSE", "MAE", "R2", "MinMaxAcc")
+  
+  test_results[[as.character(seed)]] <- tibble(
+    Seed = seed,
+    Model = c("Elastic Net", "SVM", "Random Forest", "XGBoost"),
+    COR = metrics_mat[, "COR"],
+    RMSE = metrics_mat[, "RMSE"],
+    MAE = metrics_mat[, "MAE"],
+    R2 = metrics_mat[, "R2"],
+    MinMaxAcc = metrics_mat[, "MinMaxAcc"]
+  )
+}
+
+
+# Combine all results into a single dataframe
+final_results_original <- bind_rows(test_results)
+
+# View
+print(final_results_original)
+```
+
+## Summarize performance metrics
+
+```{r final summary}
+summary_stats_original <- final_results_original %>%
+  group_by(Model) %>%
+  summarise(
+    mean_COR = mean(COR),     sd_COR = sd(COR),
+    mean_RMSE = mean(RMSE),   sd_RMSE = sd(RMSE),
+    mean_MAE = mean(MAE),     sd_MAE = sd(MAE),
+    mean_R2 = mean(R2),       sd_R2 = sd(R2),
+    mean_MinMax = mean(MinMaxAcc), sd_MinMax = sd(MinMaxAcc),
+    .groups = "drop"
+  )
+
+print(summary_stats_original)
+saveRDS(summary_stats_original, file = "summary_stats_original.rds")
+
+
+# Make table
+# Format the summary table
+model_perf_ori_table <- summary_stats_original %>%
+  rename_with(~ str_replace(., "_", " ")) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 4. Model Performance Summary (Before Residualization)"
+  ) %>%
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 3
+  ) %>%
+  cols_label(
+    Model = "Model",
+    `mean COR` = "COR (Mean)",
+    `sd COR` = "COR (SD)",
+    `mean RMSE` = "RMSE (Mean)",
+    `sd RMSE` = "RMSE (SD)",
+    `mean MAE` = "MAE (Mean)",
+    `sd MAE` = "MAE (SD)",
+    `mean R2` = "R² (Mean)",
+    `sd R2` = "R² (SD)",
+    `mean MinMax` = "Min-Max (Mean)",
+    `sd MinMax` = "Min-Max (SD)"
+  ) %>%
+  tab_options(
+    table.font.names = c("Aptos", "Segoe UI", "Arial", "sans-serif"),
+    heading.title.font.size = 14,
+    heading.title.font.weight = "bold",
+    table.font.size = 12
+  )
+
+print(model_perf_ori_table)
+```
+
+## Metrics visualizations
+
+```{r metrics viz}
+# Convert to long format for plotting
+results_long <- final_results_original %>%
+  pivot_longer(
+    cols = c(R2, RMSE, MAE, COR, MinMaxAcc),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Set factor order for prettier plots
+results_long$Model <- factor(results_long$Model, levels = c("Elastic Net", "SVM", "Random Forest", "XGBoost"))
+
+# Define a named vector for y-axis labels
+metric_labels <- c(
+  R2 = "R² (Explained Variance)",
+  RMSE = "Root Mean Square Error",
+  MAE = "Mean Absolute Error",
+  COR = "Correlation",
+  MinMaxAcc = "Min-Max Accuracy"
+)
+
+# Create a separate boxplot for each metric
+for (metric_name in unique(results_long$Metric)) {
+  p <- results_long %>%
+    filter(Metric == metric_name) %>%
+    ggplot(aes(x = Model, y = Value, fill = Model)) +
+    geom_boxplot(alpha = 0.7) +
+    labs(
+      title = paste("Model Comparison on", metric_labels[metric_name]),
+      y = metric_labels[metric_name],
+      x = "Model"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "none")
+
+  print(p)
+}
+
+# Convert to long format
+results_long <- final_results_original %>%
+  pivot_longer(
+    cols = c(R2, RMSE, MAE, COR, MinMaxAcc),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Set factor order
+results_long$Model <- factor(results_long$Model, levels = c("Elastic Net", "SVM", "Random Forest", "XGBoost"))
+
+# Define pretty labels
+metric_labels <- c(
+  R2 = "R² (Explained Variance)",
+  RMSE = "Root Mean Square Error",
+  MAE = "Mean Absolute Error",
+  COR = "Correlation",
+  MinMaxAcc = "Min-Max Accuracy"
+)
+
+# Faceted boxplot
+facet_plot <- ggplot(results_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_boxplot(alpha = 0.75, width = 0.65, outlier.shape = NA) +
+  facet_wrap(~ Metric, scales = "free_y", labeller = as_labeller(metric_labels)) +
+  labs(
+    title = "Model Performance Across Evaluation Metrics",
+    x = "Model",
+    y = NULL
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 13, face = "bold"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+
+print(facet_plot)
+```
+
+# Confounding Factor Mitigation
+
+## Assess class imbalance for categorical variables
+
+```{r confounding assess}
+## Identify brand columns
+brand_cols <- grep("^brand_name", names(df_selected), value = TRUE)
+
+## Reconstruct original brand variables
+# Extract the one-hot encoded brand columns
+brand_matrix <- df_selected[, brand_cols]
+
+# Get most likely brand per row (column with 1)
+brand_vector <- brand_cols[max.col(brand_matrix, ties.method = "first")]
+
+# Add it as a new column
+df_selected$brand_label <- gsub("^brand_name", "", brand_vector)
+
+## Count distribution
+df_selected %>%
+  count(brand_label, sort = TRUE) %>%
+  mutate(perc = round(100 * n / sum(n), 2))
+
+## Visualize the imbalance
+df_selected %>%
+  count(brand_label) %>%
+  filter(n > 10) %>%  # filter small brands for readability
+  ggplot(aes(x = reorder(brand_label, -n), y = n)) +
+  geom_col(fill = "skyblue") +
+  labs(title = "Brand Frequency in Dataset", x = "Brand", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Brand residualization
+
+```{r brand residualization}
+# Identify brand one-hot columns
+brand_cols <- grep("^brand_name", names(df_selected), value = TRUE)
+
+# Recover brand label (from one-hot)
+df_selected <- df_selected %>%
+  mutate(brand_label = apply(select(., all_of(brand_cols)), 1, function(x) {
+    brand <- names(x)[which.max(x)]
+    str_remove(brand, "^brand_name")
+  }))
+
+# Split data first - to avoid leakage
+set.seed(310347)
+n <- nrow(df_selected)
+idx <- sample(1:n)
+train_idx <- idx[1:round(0.6 * n)]
+valid_idx <- idx[(round(0.6 * n) + 1):round(0.8 * n)]
+test_idx  <- idx[(round(0.8 * n) + 1):n]
+
+train_data <- df_selected[train_idx, ]
+valid_data <- df_selected[valid_idx, ]
+test_data  <- df_selected[test_idx, ]
+
+# Compute train-only brand average
+brand_avg_train <- train_data %>%
+  group_by(brand_label) %>%
+  summarise(brand_log_reviews_avg = mean(log_reviews), .groups = "drop")
+
+# Join and residualize
+train_data <- train_data %>%
+  left_join(brand_avg_train, by = "brand_label") %>%
+  mutate(log_reviews_adj = log_reviews - brand_log_reviews_avg)
+
+valid_data <- valid_data %>%
+  left_join(brand_avg_train, by = "brand_label") %>%
+  mutate(log_reviews_adj = log_reviews - brand_log_reviews_avg)
+
+test_data <- test_data %>%
+  left_join(brand_avg_train, by = "brand_label") %>%
+  mutate(log_reviews_adj = log_reviews - brand_log_reviews_avg)
+
+# Define modeling features - now exclude brand info
+feature_cols <- setdiff(
+  colnames(df_selected),
+  c("log_reviews", "log_reviews_adj", "brand_label", "brand_log_reviews_avg", brand_cols)
+)
+
+print(feature_cols)
+```
+
+## Loop through each of the 10 seeds and evaluate models + split into train/valid/test - using log_reviews_adj as target
+
+```{r residualization models}
+data <- df_selected  # One-hot encoded data with brand_label
+
+seeds <- c(
+  1858457295, 2036963932, 192671141, 468479813, 53785150,
+  1856229789, 1637320965, 659875641, 1107319086, 359741198
+)
+
+test_results <- list()
+
+for (seed in seeds) {
+  set.seed(seed)
+
+  # Split data
+  n <- nrow(data)
+  idx <- sample(seq_len(n))
+  train_idx <- idx[1:floor(0.6 * n)]
+  valid_idx <- idx[(floor(0.6 * n) + 1):(floor(0.8 * n))]
+  test_idx  <- idx[(floor(0.8 * n) + 1):n]
+
+  train_data <- data[train_idx, ]
+  valid_data <- data[valid_idx, ]
+  test_data  <- data[test_idx, ]
+
+  # Brand average from training set
+  brand_avg_train <- train_data %>%
+    group_by(brand_label) %>%
+    summarise(brand_log_reviews_avg = mean(log_reviews), .groups = "drop")
+
+  # Residualize
+  residualize <- function(df) {
+    df %>%
+      select(-matches("^brand_log_reviews_avg$|^log_reviews_adj$")) %>%
+      left_join(brand_avg_train, by = "brand_label") %>%
+      mutate(log_reviews_adj = log_reviews - brand_log_reviews_avg)
+  }
+
+  train_data <- residualize(train_data)
+  valid_data <- residualize(valid_data)
+  test_data  <- residualize(test_data)
+
+  # Train Models (All use feature_cols only)
+
+  ## Elastic Net
+  model_lm <- glmnet(
+    x = as.matrix(train_data[, feature_cols]),
+    y = train_data$log_reviews_adj,
+    alpha = enet_best_params$alpha,
+    lambda = enet_best_params$lambda
+  )
+  pred_lm <- predict(model_lm, newx = as.matrix(test_data[, feature_cols]), s = enet_best_params$lambda)
+
+  ## SVM
+  model_svm <- svm(
+    x = train_data[, feature_cols],
+    y = train_data$log_reviews_adj,
+    cost = svm_best_params$cost,
+    gamma = svm_best_params$gamma,
+    kernel = "radial",
+    scale = TRUE
+  )
+  pred_svm <- predict(model_svm, newdata = test_data[, feature_cols])
+
+  ## Random Forest
+  model_rf <- randomForest(
+    x = train_data[, feature_cols],
+    y = train_data$log_reviews_adj,
+    mtry = rf_best_params$mtry,
+    ntree = rf_best_params$ntree
+  )
+  pred_rf <- predict(model_rf, newdata = test_data[, feature_cols])
+
+  ## XGBoost
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data[, feature_cols]), label = train_data$log_reviews_adj)
+  dtest  <- xgb.DMatrix(data = as.matrix(test_data[, feature_cols]), label = test_data$log_reviews_adj)
+
+  model_xgb <- xgb.train(
+    params = c(xgb_best_params, objective = "reg:squarederror"),
+    data = dtrain,
+    nrounds = xgb_best_nrounds,
+    verbose = 0
+  )
+  pred_xgb <- predict(model_xgb, newdata = dtest)
+
+  # Evaluate Metrics
+  eval_metrics <- function(preds, actual) {
+    cor_val <- cor(preds, actual)
+    rmse <- sqrt(mean((preds - actual)^2))
+    mae <- mean(abs(preds - actual))
+    r2 <- 1 - sum((preds - actual)^2) / sum((actual - mean(actual))^2)
+    minmax <- mean(pmin(preds, actual) / pmax(preds, actual))
+    return(c(COR = cor_val, RMSE = rmse, MAE = mae, R2 = r2, MinMaxAcc = minmax))
+  }
+
+  metrics_mat <- rbind(
+    eval_metrics(pred_lm, test_data$log_reviews_adj),
+    eval_metrics(pred_svm, test_data$log_reviews_adj),
+    eval_metrics(pred_rf, test_data$log_reviews_adj),
+    eval_metrics(pred_xgb, test_data$log_reviews_adj)
+  )
+
+  colnames(metrics_mat) <- c("COR", "RMSE", "MAE", "R2", "MinMaxAcc")
+
+  test_results[[as.character(seed)]] <- tibble(
+    Seed = seed,
+    Model = c("Elastic Net", "SVM", "Random Forest", "XGBoost"),
+    COR = metrics_mat[, "COR"],
+    RMSE = metrics_mat[, "RMSE"],
+    MAE = metrics_mat[, "MAE"],
+    R2 = metrics_mat[, "R2"],
+    MinMaxAcc = metrics_mat[, "MinMaxAcc"]
+  )
+}
+
+# Combine results
+final_results_adjusted <- bind_rows(test_results)
+```
+
+## Summarize performance metrics - after residualization
+
+```{r summary residualization}
+summary_stats_adjusted <- final_results_adjusted %>%
+  group_by(Model) %>%
+  summarise(
+    mean_COR = mean(COR),     sd_COR = sd(COR),
+    mean_RMSE = mean(RMSE),   sd_RMSE = sd(RMSE),
+    mean_MAE = mean(MAE),     sd_MAE = sd(MAE),
+    mean_R2 = mean(R2),       sd_R2 = sd(R2),
+    mean_MinMax = mean(MinMaxAcc), sd_MinMax = sd(MinMaxAcc),
+    .groups = "drop"
+  )
+
+print(summary_stats_adjusted)
+saveRDS(summary_stats_adjusted, file = "summary_stats_adjusted.rds")
+
+
+# Make table
+# Format the summary table
+model_perf_adj_table <- summary_stats_adjusted %>%
+  rename_with(~ str_replace(., "_", " ")) %>%
+  gt() %>%
+  tab_header(
+    title = "Table 5. Model Performance Summary (After Residualization)"
+  ) %>%
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 3
+  ) %>%
+  cols_label(
+    Model = "Model",
+    `mean COR` = "COR (Mean)",
+    `sd COR` = "COR (SD)",
+    `mean RMSE` = "RMSE (Mean)",
+    `sd RMSE` = "RMSE (SD)",
+    `mean MAE` = "MAE (Mean)",
+    `sd MAE` = "MAE (SD)",
+    `mean R2` = "R² (Mean)",
+    `sd R2` = "R² (SD)",
+    `mean MinMax` = "Min-Max (Mean)",
+    `sd MinMax` = "Min-Max (SD)"
+  ) %>%
+  tab_options(
+    table.font.names = c("Aptos", "Segoe UI", "Arial", "sans-serif"),
+    heading.title.font.size = 14,
+    heading.title.font.weight = "bold",
+    table.font.size = 12
+  )
+
+print(model_perf_adj_table)
+```
+
+# Feature Importance
+
+## Random Forest feature importance (before residualization)
+
+```{r feature importance rf}
+# Fit final Random Forest on full training data
+final_rf_model <- randomForest(
+  log_reviews ~ ., 
+  data = data,
+  mtry = rf_best_params$mtry,
+  ntree = rf_best_params$ntree,
+  importance = TRUE
+)
+
+# Get and view variable importance
+rf_importance <- importance(final_rf_model, type = 1)  # Type 1 = %IncMSE
+rf_importance_df <- as.data.frame(rf_importance) %>%
+  rownames_to_column(var = "Feature") %>%
+  arrange(desc(`%IncMSE`))
+
+# View top features
+print(rf_importance_df)
+
+# Visualize
+# Compute variable importance again if needed
+rf_importance_df <- as.data.frame(importance(final_rf_model, type = 1)) %>%
+  rownames_to_column(var = "Feature") %>%
+  rename(IncMSE = `%IncMSE`) %>%
+  arrange(desc(IncMSE))
+
+# Select top 20 features
+top_n <- 20
+top_features_rf <- rf_importance_df %>%
+  slice_max(order_by = IncMSE, n = top_n)
+
+# Plot
+ggplot(top_features_rf, aes(x = reorder(Feature, IncMSE), y = IncMSE)) +
+  geom_col(fill = "#4B9CD3") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Top 20 Most Important Features (Random Forest)",
+    x = "Feature",
+    y = "% Increase in MSE"
+  )
+```
+
+
+## XGBoost feature importance (before residualization)
+
+```{r feature importance xgb}
+# Convert training data to matrix (X) and vector (y)
+# Convert all columns to numeric before converting to matrix
+X <- data %>% select(-log_reviews) %>% mutate(across(everything(), as.numeric)) %>% as.matrix()
+y <- data$log_reviews
+
+
+# Fit XGBoost model with best hyperparameters
+final_xgb_model <- xgboost(
+  data = X,
+  label = y,
+  nrounds = xgb_best_nrounds,
+  eta = xgb_best_params$eta,
+  max_depth = xgb_best_params$max_depth,
+  subsample = xgb_best_params$subsample,
+  colsample_bytree = xgb_best_params$colsample_bytree,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+
+# Get feature importance
+xgb_importance <- xgb.importance(model = final_xgb_model)
+xgb_importance_df <- as.data.frame(xgb_importance)
+
+# View top features
+print(xgb_importance_df)
+
+# Visualize
+# Select top 20 by Gain
+top_features_xgb <- xgb_importance_df %>%
+  slice_max(order_by = Gain, n = 20)
+
+# Plot
+ggplot(top_features_xgb, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "#4B9CD3") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Top 20 Most Important Features (XGBoost)",
+    x = "Feature",
+    y = "Gain"
+  )
+```
