@@ -115,6 +115,54 @@ df_clean <- df_clean %>%
   mutate(log_reviews = log1p(reviews))
 ```
 
+## Assumptions Check
+
+```{r}
+# Fit a linear model using the predictors
+assumption_model <- lm(log_reviews ~ brand_name + price_usd + limited_edition + new + online_only +
+                         out_of_stock + sephora_exclusive + child_count +
+                         primary_category, data = df_clean)
+
+# Extract standardized residuals and fitted values
+standardized <- rstandard(assumption_model)
+fitted_vals <- fitted(assumption_model)
+```
+
+### Normality
+
+```{r}
+hist(standardized)
+```
+
+### Linearity
+
+```{r}
+{
+  qqnorm(standardized)
+  abline(0,1)
+}
+```
+
+### Homoscedasticity
+
+```{r}
+{
+  plot(standardized, fitted_vals)
+  abline(v = 0)
+  abline(h = 0)
+}
+```
+
+
+### Multicollinearity check for predictors
+
+```{r}
+vif_model1 <- lm(log_reviews ~ brand_name + price_usd + limited_edition + new + online_only +
+                out_of_stock + sephora_exclusive + child_count + 
+                primary_category, data = df_clean)
+vif(vif_model1)
+```
+
 ## Test for multicollinearity (between rating, review, and loves count)
 
 ```{r multicollinearity test}
@@ -141,6 +189,7 @@ ggplot(df_clean, aes(x = log_reviews)) +
   geom_histogram(bins = 30, fill = "skyblue") +
   labs(title = "Distribution of Log Reviews")
 ```
+
 # Descriptive Statistics
 
 ```{r descriptive stats}
